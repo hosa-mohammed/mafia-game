@@ -49,3 +49,11 @@ hr{border:none;border-top:1px solid var(--line);margin:10px 0}
 .hosttools{display:flex;justify-content:center;margin-top:6px}
 .peek{margin-top:10px;font-size:1.25rem;font-weight:800}
 .hidden{display:none}
+/* نظام الغرف */
+.roomhead{display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap}
+.code{font-size:1.5rem;font-weight:800;letter-spacing:4px;color:var(--gold)}
+.minibtn{background:transparent;border:1px solid var(--line);color:var(--dim);
+  border-radius:10px;padding:6px 10px;font-size:.85rem;cursor:pointer;font-family:inherit}
+.minibtn.kick{color:var(--red);border-color:#3a1a1c}
+.pub{display:flex;justify-content:space-between;align-items:center;gap:8px;
+  border-bottom:1px dashed var(--line);padding:10px 4px}

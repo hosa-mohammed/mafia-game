@@ -1,8 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-game.py — الحكم الآلي v3
+game.py — الحكم الآلي v4 + نظام الغرف
 الأدوار: مافيا | دكتور | محقق | قناص | سجان | مستعلم | مواطن
-المستعلم: كل ليلتين يقرر كشف أدوار جميع الأموات للجميع — بدون أسماء
 """
 import random
 import time
@@ -17,7 +16,8 @@ DAWN, DISCUSSION, VOTING, EXECUTION, GAMEOVER = "DAWN", "DISCUSSION", "VOTING", 
 REVEAL_SECONDS = 12
 DAWN_SECONDS = 15
 EXECUTION_SECONDS = 12
-INQUIRER_EVERY = 2  # الكشف في الليالي 2، 4، 6... (لجعله بالليالي الفردية 1،3،5: غيّر الشرط إلى % 2 == 1)
+INQUIRER_EVERY = 2      # كشف المستعلم في الليالي 2، 4، 6...
+MAX_PLAYERS = 20        # سقف الغرفة
 
 ROLE_AR = {
     "MAFIA": "مافيا", "DOCTOR": "دكتور", "DETECTIVE": "محقق",
@@ -35,18 +35,20 @@ class Player:
         self.token = uuid.uuid4().hex
         self.role = None
         self.alive = True
+        self.left = False          # خرج/أُخرج أثناء الجولة
         self.is_host = False
         self.pick = None
         self.confirmed = False
-        self.detective_results = {}    # سري للمحقق فقط
-        self.suspicions = {}           # شكوك شخصية
+        self.detective_results = {}
+        self.suspicions = {}
         self.jailed_last = None
         self.shot_used = False
-        self.inquirer_decision = None  # قرار ليلة الكشف: True / False / None
+        self.inquirer_decision = None
         self.joined_at = time.time()
 
     def reset_for_game(self):
-        self.role, self.alive, self.pick, self.confirmed = None, True, None, False
+        self.role, self.alive, self.left = None, True, False
+        self.pick, self.confirmed = None, False
         self.detective_results = {}
         self.suspicions, self.jailed_last, self.shot_used = {}, None, False
         self.inquirer_decision = None
@@ -60,7 +62,7 @@ class Game:
         self.round = 0
         self.winner = None
         self.public = {}
-        self.reveals = []              # سجل الكشوف العلني — يراه الجميع
+        self.reveals = []
         self._ni = 0
         self.night_picks = {}
         self.votes = {}
@@ -79,7 +81,48 @@ class Game:
         self.players[p.id] = p
         return p
 
+    def name_taken(self, name, exclude_pid=None):
+        return any(q.name == name and q.id != exclude_pid for q in self.players.values())
+
+    def rename(self, pid, new_name):
+        p = self.players.get(pid)
+        if not p:
+            return "لاعب غير معروف"
+        if self.phase != LOBBY:
+            return "تغيير الاسم متاح قبل بدء الجولة فقط"
+        name = (new_name or "").strip()[:20]
+        if not name:
+            return "الاسم مطلوب"
+        if self.name_taken(name, pid):
+            return "هذا الاسم مستخدم في الغرفة — اختر غيره"
+        p.name = name
+        return None
+
+    def remove_player(self, pid):
+        """في البهو: حذف كامل. أثناء الجولة: يُحسب خروجاً (كالموت بدون كشف دوره)."""
+        p = self.players.get(pid)
+        if not p:
+            return
+        was_host = p.is_host
+        if self.phase == LOBBY:
+            del self.players[pid]
+        else:
+            p.alive, p.left = False, True
+            p.pick, p.confirmed = None, False
+            p.is_host = False
+            self.votes.pop(pid, None)
+            self.night_picks.get("mafia", {}).pop(pid, None)
+            self.check_win()
+        if was_host:  # نقل القيادة لأقدم لاعب متبقٍ
+            others = sorted((q for q in self.players.values() if q.id != pid),
+                            key=lambda x: x.joined_at)
+            if others:
+                others[0].is_host = True
+
     def restart(self):
+        # المغادرون يُحذفون نهائياً عند بدء جولة جديدة
+        for pid in [q.id for q in self.players.values() if q.left]:
+            del self.players[pid]
         for p in self.players.values():
             p.reset_for_game()
         self.phase, self.phase_end = LOBBY, 0.0
@@ -186,7 +229,7 @@ class Game:
         p.inquirer_decision = bool(approve)
         return None
 
-    # ---------- الاختيار والتأكيد (واجهة موحّدة، معنى سري) ----------
+    # ---------- الاختيار والتأكيد ----------
     def set_pick(self, pid, target_id):
         p = self.players.get(pid)
         if not p:
@@ -200,13 +243,9 @@ class Game:
         if ph not in (NIGHT_MAFIA, NIGHT_DOCTOR, NIGHT_JAILER, NIGHT_SNIPER,
                       NIGHT_DETECTIVE, NIGHT_INQUIRER, VOTING):
             return "ليس وقت الاختيار"
-
-        # السجن يعطّل قدرة صاحبها — بدون أي تسريب للآخرين
         if ph in JAIL_BLOCKED and JAIL_BLOCKED[ph] == p.role and p.alive \
                 and self.night_picks.get("jailer") == pid:
             return "🚫 أنت مسجون هذه الليلة — قدرتك معطّلة"
-
-        # قيود خاصة قبل التسجيل
         if ph == NIGHT_JAILER and p.alive and p.role == "JAILER":
             if target_id == pid:
                 return "لا يمكنك سجن نفسك"
@@ -214,13 +253,12 @@ class Game:
                 return "لا يمكنك تكرار سجن نفس الشخص ليلتين متتاليتين"
 
         p.pick = target_id
-
         if ph == VOTING:
             if p.alive:
                 self.votes[pid] = target_id
             return None
         if not p.alive:
-            return None  # ضغطات الموتى تُتجاهل بصمت
+            return None
 
         acted = False
         if p.role == "MAFIA" and ph == NIGHT_MAFIA:
@@ -242,9 +280,8 @@ class Game:
                 "text": "مافيا!" if is_m else "ليس مافيا",
                 "tone": "bad" if is_m else "good"}
             acted = True
-        # المستعلم: اختياره في الشبكة تمويه/شك فقط — قراره الحقيقي عبر inquirer_decide
 
-        if not acted:  # لا فعل حقيقي → يُسجَّل كشك شخصي
+        if not acted:
             p.suspicions[target_id] = p.suspicions.get(target_id, 0) + 1
         return None
 
@@ -262,7 +299,6 @@ class Game:
         np = self.night_picks
         deaths = []
 
-        # 1) طلقة القناص
         sn = self._find_role("SNIPER")
         if sn and np.get("sniper") and sn.alive and not sn.shot_used \
                 and np.get("jailer") != sn.id:
@@ -272,7 +308,6 @@ class Game:
                 v.alive = False
                 deaths.append(v)
 
-        # 2) هجوم المافيا — صوت المسجون يُلغى، والأعلى تصويتاً هو الهدف
         counts = {}
         for mpid, tgt in np["mafia"].items():
             mp = self.players[mpid]
@@ -284,7 +319,7 @@ class Game:
             kill = random.choice([t for t, c in counts.items() if c == mx])
         if kill:
             if kill == np.get("jailer") or kill == np.get("doctor"):
-                pass  # محمي (سجان) أو نُقذ (دكتور)
+                pass
             else:
                 v = self.players[kill]
                 if v.alive:
@@ -295,7 +330,6 @@ class Game:
         if jr:
             jr.jailed_last = np.get("jailer")
 
-        # 3) كشف المستعلم: أدوار الأموات مجتمعة — بدون أسماء
         reveal = None
         inq = self._find_role("INQUIRER")
         if inq and inq.alive and inq.inquirer_decision is True \
@@ -308,7 +342,6 @@ class Game:
                       for r in REVEAL_ORDER if r in cnt]
             self.reveals.append({"round": self.round, "roles": reveal})
 
-        # الإعلان: أسماء القتلى فقط + الكشف (بدون أسماء) — الأدوار سر حتى النهاية
         self.public = {"type": "DAWN",
                        "deaths": [{"name": v.name} for v in deaths],
                        "inquirer_reveal": reveal}
@@ -374,6 +407,9 @@ class Game:
                 self.phase = DISCUSSION
                 self.phase_end = time.time() + self.settings["discussion_seconds"]
         elif ph == DISCUSSION:
+            if self.winner:   # قد يفوز فريق بأكمله بسبب خروج لاعبين أثناء المناقشة
+                self._game_over()
+                return
             for p in self.players.values():
                 p.pick, p.confirmed = None, False
             self.votes = {}
@@ -387,10 +423,11 @@ class Game:
             else:
                 self._begin_night()
 
-    # ---------- لقطة الحالة (مصفّاة لكل لاعب) ----------
+    # ---------- لقطة الحالة ----------
     def snapshot(self, pid):
         now = time.time()
-        players = [{"id": p.id, "name": p.name, "alive": p.alive, "is_host": p.is_host}
+        players = [{"id": p.id, "name": p.name, "alive": p.alive,
+                    "left": p.left, "is_host": p.is_host}
                    for p in sorted(self.players.values(), key=lambda x: x.joined_at)]
         snap = {
             "phase": self.phase, "round": self.round,
@@ -403,8 +440,8 @@ class Game:
         }
         me = self.players.get(pid)
         if me:
-            y = {"id": me.id, "name": me.name, "alive": me.alive, "is_host": me.is_host,
-                 "confirmed": me.confirmed, "pick": me.pick,
+            y = {"id": me.id, "name": me.name, "alive": me.alive, "left": me.left,
+                 "is_host": me.is_host, "confirmed": me.confirmed, "pick": me.pick,
                  "role": me.role, "role_ar": ROLE_AR.get(me.role, ""),
                  "shot_used": me.shot_used}
             y["suspicions"] = [{"name": self.players[k].name, "count": c}
@@ -433,3 +470,25 @@ class Game:
             snap["reveal_all"] = [{"name": p.name, "role_ar": ROLE_AR[p.role], "alive": p.alive}
                                   for p in sorted(self.players.values(), key=lambda x: x.joined_at)]
         return snap
+
+
+# ---------- الغرفة: تغلّف اللعبة بهوية ودخول مضبوط ----------
+class Room:
+    def __init__(self, code, name, is_public):
+        self.code = code
+        self.name = name
+        self.is_public = is_public
+        self.locked = False
+        self.created_at = time.time()
+        self.last_activity = time.time()
+        self.game = Game()
+
+    def touch(self):
+        self.last_activity = time.time()
+
+    def info(self):
+        g = self.game
+        host = next((p.name for p in g.players.values() if p.is_host), "—")
+        return {"code": self.code, "name": self.name,
+                "players": len(g.players), "max": MAX_PLAYERS,
+                "host": host}
